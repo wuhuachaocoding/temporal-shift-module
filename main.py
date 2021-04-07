@@ -21,13 +21,20 @@ from ops.temporal_shift import make_temporal_pool
 
 from tensorboardX import SummaryWriter
 
+#whc
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+
 best_prec1 = 0
 
 
-def main():
+def main(rank):
     global args, best_prec1
     args = parser.parse_args()
 
+    device_id = int(os.environ.get('LOCAL_RANK', args.local_rank))
+    print("====rank={}    device_id={} ".format(rank,device_id))
+    
     num_class, args.train_list, args.val_list, args.root_path, prefix = dataset_config.return_dataset(args.dataset,
                                                                                                       args.modality)
     full_arch_name = args.arch
@@ -49,6 +56,8 @@ def main():
     if args.suffix is not None:
         args.store_name += '_{}'.format(args.suffix)
     print('storing name: ' + args.store_name)
+    
+    torch.cuda.set_device(device_id)
 
     check_rootfolders()
 
@@ -71,8 +80,9 @@ def main():
     policies = model.get_optim_policies()
     train_augmentation = model.get_augmentation(flip=False if 'something' in args.dataset or 'jester' in args.dataset else True)
 
-    model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
-
+    #model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
+    model = model.cuda()
+    model = torch.nn.parallel.DistributedDataParallel(model,device_ids=[device_id], output_device=device_id) 
     optimizer = torch.optim.SGD(policies,
                                 args.lr,
                                 momentum=args.momentum,
@@ -137,9 +147,8 @@ def main():
         data_length = 1
     elif args.modality in ['Flow', 'RGBDiff']:
         data_length = 5
-
-    train_loader = torch.utils.data.DataLoader(
-        TSNDataSet(args.root_path, args.train_list, num_segments=args.num_segments,
+    
+    train_dataset = TSNDataSet(args.root_path, args.train_list, num_segments=args.num_segments,
                    new_length=data_length,
                    modality=args.modality,
                    image_tmpl=prefix,
@@ -148,12 +157,19 @@ def main():
                        Stack(roll=(args.arch in ['BNInception', 'InceptionV3'])),
                        ToTorchFormatTensor(div=(args.arch not in ['BNInception', 'InceptionV3'])),
                        normalize,
-                   ]), dense_sample=args.dense_sample),
-        batch_size=args.batch_size, shuffle=True,
+                   ]), dense_sample=args.dense_sample)
+    
+    train_sampler = DistributedSampler(train_dataset, shuffle=True)
+    
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        sampler=train_sampler,
         num_workers=args.workers, pin_memory=True,
         drop_last=True)  # prevent something not % n_GPU
-
-    val_loader = torch.utils.data.DataLoader(
+    
+    if rank == 0:
+        val_loader = torch.utils.data.DataLoader(
         TSNDataSet(args.root_path, args.val_list, num_segments=args.num_segments,
                    new_length=data_length,
                    modality=args.modality,
@@ -168,7 +184,7 @@ def main():
                    ]), dense_sample=args.dense_sample),
         batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
-
+  
     # define loss function (criterion) and optimizer
     if args.loss_type == 'nll':
         criterion = torch.nn.CrossEntropyLoss().cuda()
@@ -187,14 +203,18 @@ def main():
     with open(os.path.join(args.root_log, args.store_name, 'args.txt'), 'w') as f:
         f.write(str(args))
     tf_writer = SummaryWriter(log_dir=os.path.join(args.root_log, args.store_name))
+    
+    scaler = torch.cuda.amp.GradScaler(args.amp)
+
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch, args.lr_type, args.lr_steps)
-
+        train_sampler.set_epoch(epoch)
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
-
+        train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer,scaler,args.batch_size,args.amp,rank)
+        #train(train_loader, model, criterion, optimizer, epoch, log_training, tf_writer)
         # evaluate on validation set
-        if (epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1:
+        
+        if rank == 0 and ((epoch + 1) % args.eval_freq == 0 or epoch == args.epochs - 1):
             prec1 = validate(val_loader, model, criterion, epoch, log_training, tf_writer)
 
             # remember best prec@1 and save checkpoint
@@ -215,10 +235,10 @@ def main():
                 'best_prec1': best_prec1,
             }, is_best)
 
-
-def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
+def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer,scaler,batch_size,use_amp,rank=None):
+    if rank == 0:
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
@@ -230,19 +250,24 @@ def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
 
     # switch to train mode
     model.train()
-
-    end = time.time()
+    if rank == 0:
+        end = time.time()
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
-        data_time.update(time.time() - end)
-
+        if rank == 0:
+            data_time.update(time.time() - end)
         target = target.cuda()
         input_var = torch.autograd.Variable(input)
         target_var = torch.autograd.Variable(target)
 
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
+        if use_amp:
+            # compute output
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                output = model(input_var)
+                loss = criterion(output, target_var)
+        else:
+                output = model(input_var)
+                loss = criterion(output, target_var)
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
@@ -251,19 +276,31 @@ def train(train_loader, model, criterion, optimizer, epoch, log, tf_writer):
         top5.update(prec5.item(), input.size(0))
 
         # compute gradient and do SGD step
-        loss.backward()
+        #loss.backward()
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if args.clip_gradient is not None:
+            if use_amp:
+                scaler.unscale_(optimizer)
             total_norm = clip_grad_norm_(model.parameters(), args.clip_gradient)
+        
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
-        optimizer.step()
         optimizer.zero_grad()
 
         # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
+        if rank == 0:
+            batch_time.update(time.time() - end)
+            end = time.time()
 
-        if i % args.print_freq == 0:
+        if i % args.print_freq == 0 and rank == 0:
             output = ('Epoch: [{0}][{1}/{2}], lr: {lr:.5f}\t'
                       'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                       'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
@@ -373,6 +410,17 @@ def check_rootfolders():
             print('creating folder ' + folder)
             os.mkdir(folder)
 
+def run():
+    current_env = os.environ.copy()
+    current_env["MASTER_ADDR"] = os.environ.get('MASTER_ADDR') 
+    current_env["MASTER_PORT"] = os.environ.get('MASTER_PORT)
+    current_env["WORLD_SIZE"] = os.environ.get('WORLD_SIZE')
+    current_env["OMP_NUM_THREADS"] = str(1)
+    distributed_init_method = r'env://'
+    dist.init_process_group(backend="nccl", init_method=distributed_init_method)
+    distributed_world_size = int(os.environ['WORLD_SIZE'])
+    distributed_rank = dist.get_rank()
+    main(distributed_rank)
 
 if __name__ == '__main__':
-    main()
+    run()
