@@ -413,7 +413,7 @@ def check_rootfolders():
 def run():
     current_env = os.environ.copy()
     current_env["MASTER_ADDR"] = os.environ.get('MASTER_ADDR') 
-    current_env["MASTER_PORT"] = os.environ.get('MASTER_PORT)
+    current_env["MASTER_PORT"] = os.environ.get('MASTER_PORT')
     current_env["WORLD_SIZE"] = os.environ.get('WORLD_SIZE')
     current_env["OMP_NUM_THREADS"] = str(1)
     distributed_init_method = r'env://'
